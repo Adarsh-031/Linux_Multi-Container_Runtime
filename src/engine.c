@@ -1,7 +1,7 @@
 /*
  * engine.c - Supervised Multi-Container Runtime (User Space)
  *
- * Full implementation of all TODO sections from the boilerplate.
+ * Full implementation of all TODO sections from the src.
  *
  * Architecture:
  *   - Supervisor daemon: UNIX domain socket for control plane (Path B),
@@ -77,7 +77,7 @@ typedef enum {
 /* ------------------------------------------------------------------ */
 /* container_record_t                                                  */
 /*                                                                     */
-/* Extended from the boilerplate to include:                           */
+/* Extended from the src to include:                           */
 /*   stop_requested  - set before SIGTERM so reap_children can         */
 /*                     distinguish a manual stop from a hard-limit kill */
 /*   log_pipe_read_fd - supervisor's end of the per-container log pipe */
@@ -107,7 +107,7 @@ typedef struct container_record {
 } container_record_t;
 
 /* ------------------------------------------------------------------ */
-/* Other types (unchanged from boilerplate)                            */
+/* Other types (unchanged from src)                            */
 /* ------------------------------------------------------------------ */
 typedef struct {
     char   container_id[CONTAINER_ID_LEN];
@@ -177,7 +177,7 @@ static void handle_sigchld(int sig) { (void)sig; g_sigchld_pending = 1; }
 static void handle_stop(int sig)    { (void)sig; g_stop_pending    = 1; }
 
 /* ------------------------------------------------------------------ */
-/* Usage / parsing helpers (unchanged from boilerplate)               */
+/* Usage / parsing helpers (unchanged from src)               */
 /* ------------------------------------------------------------------ */
 static void usage(const char *prog)
 {

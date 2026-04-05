@@ -37,7 +37,7 @@ This repository also includes a minimal GitHub Actions smoke check that is copie
 The smoke check expects this command to succeed:
 
 ```bash
-make -C boilerplate ci
+make -C src ci
 ```
 
 That target should build only the user-space binaries needed for a quick compile check and should not require `sudo`, kernel headers, module loading, rootfs setup, or a running supervisor.
@@ -45,7 +45,7 @@ That target should build only the user-space binaries needed for a quick compile
 Run the environment preflight check before implementation:
 
 ```bash
-cd boilerplate
+cd src
 chmod +x environment-check.sh
 sudo ./environment-check.sh
 ```
@@ -296,9 +296,9 @@ Address these five areas:
 5. **Scheduling Behavior**  
    Use your experiment results to explain how Linux scheduling affected your workloads. Relate your results to scheduling goals such as fairness, responsiveness, and throughput.
 
-### Boilerplate Contents
+### src Contents
 
-The `boilerplate/` folder will contain starter files for the runtime, kernel monitor, shared `ioctl` definitions, test workloads, and build flow so that you have structure for starting out.
+The `src/` folder will contain starter files for the runtime, kernel monitor, shared `ioctl` definitions, test workloads, and build flow so that you have structure for starting out.
 
 ---
 
@@ -308,7 +308,7 @@ Submit a GitHub repository containing:
 
 #### Source Files
 
-We expect you to copy the boilerplate and work on top of that, but you may then structure the repository however you want, but the following must be present:
+We expect you to copy the src and work on top of that, but you may then structure the repository however you want, but the following must be present:
 
 1. `engine.c` — user-space runtime and supervisor
 2. `monitor.c` — kernel-space memory monitor (LKM)
@@ -320,7 +320,7 @@ We expect you to copy the boilerplate and work on top of that, but you may then 
 For the inherited GitHub Actions smoke check, keep a CI-safe build path available through:
 
 ```bash
-make -C boilerplate ci
+make -C src ci
 ```
 
 This is only for quick user-space compilation checks on GitHub-hosted runners. Your full project must still build and run in the required Ubuntu VM environment.

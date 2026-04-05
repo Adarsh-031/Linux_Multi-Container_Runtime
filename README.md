@@ -27,7 +27,7 @@ sudo apt install -y build-essential linux-headers-$(uname -r)
 Run the environment preflight check:
 
 ```bash
-cd boilerplate
+cd src
 chmod +x environment-check.sh
 sudo ./environment-check.sh
 ```
@@ -52,7 +52,7 @@ Do not commit `rootfs-base/` or `rootfs-*/` to the repository.
 ### Build
 
 ```bash
-cd boilerplate
+cd src
 make
 ```
 
@@ -61,13 +61,13 @@ This builds: `engine`, `memory_hog`, `cpu_hog`, `io_pulse`, and `monitor.ko`.
 For CI-only (user-space, no kernel headers needed):
 
 ```bash
-make -C boilerplate ci
+make -C src ci
 ```
 
 ### Load the Kernel Module
 
 ```bash
-sudo insmod boilerplate/monitor.ko
+sudo insmod src/monitor.ko
 
 # Verify the control device exists
 ls -l /dev/container_monitor
@@ -76,19 +76,19 @@ ls -l /dev/container_monitor
 ### Copy Workload Binaries into the Root Filesystems
 
 ```bash
-cp boilerplate/cpu_hog    ./rootfs-alpha/
-cp boilerplate/memory_hog ./rootfs-alpha/
-cp boilerplate/io_pulse   ./rootfs-alpha/
+cp src/cpu_hog    ./rootfs-alpha/
+cp src/memory_hog ./rootfs-alpha/
+cp src/io_pulse   ./rootfs-alpha/
 
-cp boilerplate/cpu_hog    ./rootfs-beta/
-cp boilerplate/memory_hog ./rootfs-beta/
-cp boilerplate/io_pulse   ./rootfs-beta/
+cp src/cpu_hog    ./rootfs-beta/
+cp src/memory_hog ./rootfs-beta/
+cp src/io_pulse   ./rootfs-beta/
 ```
 
 ### Start the Supervisor
 
 ```bash
-sudo ./boilerplate/engine supervisor ./rootfs-base
+sudo ./src/engine supervisor ./rootfs-base
 ```
 
 The supervisor creates its control socket at `/tmp/mini_runtime.sock` and stays alive in the foreground. Open a second terminal for the CLI commands below.
@@ -97,34 +97,34 @@ The supervisor creates its control socket at `/tmp/mini_runtime.sock` and stays 
 
 ```bash
 # Start two containers in the background
-sudo ./boilerplate/engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
-sudo ./boilerplate/engine start beta  ./rootfs-beta  /bin/sh --soft-mib 64 --hard-mib 96
+sudo ./src/engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
+sudo ./src/engine start beta  ./rootfs-beta  /bin/sh --soft-mib 64 --hard-mib 96
 
 # List tracked containers and their metadata
-sudo ./boilerplate/engine ps
+sudo ./src/engine ps
 
 # Inspect a container's log output
-sudo ./boilerplate/engine logs alpha
+sudo ./src/engine logs alpha
 
 # Launch a container and block until it exits (returns exit code)
-sudo ./boilerplate/engine run alpha ./rootfs-alpha /cpu_hog 10
+sudo ./src/engine run alpha ./rootfs-alpha /cpu_hog 10
 
 # Stop a running container
-sudo ./boilerplate/engine stop alpha
-sudo ./boilerplate/engine stop beta
+sudo ./src/engine stop alpha
+sudo ./src/engine stop beta
 ```
 
 ### Run the Workloads
 
 ```bash
 # CPU-bound workload (burn CPU for N seconds)
-sudo ./boilerplate/engine start alpha ./rootfs-alpha "/cpu_hog 15"
+sudo ./src/engine start alpha ./rootfs-alpha "/cpu_hog 15"
 
 # Memory pressure workload (allocates 25 MiB chunks every 5 s, soft 20 MiB, hard 100 MiB)
-sudo ./boilerplate/engine start delta ./rootfs-delta "/memory_hog 25 5000" --soft-mib 20 --hard-mib 100
+sudo ./src/engine start delta ./rootfs-delta "/memory_hog 25 5000" --soft-mib 20 --hard-mib 100
 
 # I/O-bound workload (write bursts with fsync, sleep between)
-sudo ./boilerplate/engine start alpha ./rootfs-alpha "/io_pulse 30 200"
+sudo ./src/engine start alpha ./rootfs-alpha "/io_pulse 30 200"
 ```
 
 ### Inspect Kernel Logs
@@ -139,8 +139,8 @@ Soft-limit warnings and hard-limit kills are printed here.
 
 ```bash
 # Stop individual containers first (optional)
-sudo ./boilerplate/engine stop alpha
-sudo ./boilerplate/engine stop beta
+sudo ./src/engine stop alpha
+sudo ./src/engine stop beta
 
 # Send SIGINT or SIGTERM to the supervisor to drain logs and exit
 # (Ctrl+C in the supervisor terminal, or: sudo kill -TERM <supervisor-pid>)
@@ -155,7 +155,7 @@ ps aux | grep defunct
 ### Clean Build Artifacts
 
 ```bash
-cd boilerplate
+cd src
 make clean
 ```
 

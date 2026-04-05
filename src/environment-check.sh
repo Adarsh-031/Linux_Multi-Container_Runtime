@@ -70,7 +70,7 @@ ok "Kernel headers found at $KBUILD_DIR."
 echo "Building user targets and module..."
 LOG_FILE=$(mktemp /tmp/runtime_preflight_make.XXXXXX.log)
 if make all >"$LOG_FILE" 2>&1; then
-    ok "Boilerplate build succeeded."
+    ok "src build succeeded."
 else
     tail -n 20 "$LOG_FILE" || true
     fail "Build failed. See $LOG_FILE for details."

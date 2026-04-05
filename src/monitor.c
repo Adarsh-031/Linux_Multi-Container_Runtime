@@ -1,7 +1,7 @@
 /*
  * monitor.c - Multi-Container Memory Monitor (Linux Kernel Module)
  *
- * Provided boilerplate:
+ * Provided src:
  *   - device registration and teardown
  *   - timer setup
  *   - RSS helper

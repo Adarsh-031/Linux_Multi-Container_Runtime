@@ -1,10 +1,10 @@
 solved
 
 # Build artifacts (user-space)
-boilerplate/engine
-boilerplate/memory_hog
-boilerplate/cpu_hog
-boilerplate/io_pulse
+src/engine
+src/memory_hog
+src/cpu_hog
+src/io_pulse
 
 # Kernel module build artifacts
 *.ko

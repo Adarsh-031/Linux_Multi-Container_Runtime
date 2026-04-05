@@ -8,8 +8,8 @@ A lightweight Linux container runtime in C featuring a long-running supervisor d
 
 | Name | SRN |
 |------|-----|
-| Adarsha.E | [PES1UG24AM334 |
-| Abdul Mateen Shaikh | [PES1UG24AM332 |
+| Adarsha.E | PES1UG24AM334 |
+| Abdul Mateen Shaikh | PES1UG24AM332 |
 
 ---
 

@@ -436,7 +436,7 @@ static void *producer_thread(void *arg)
     ssize_t         n;
 
     memset(&item, 0, sizeof(item));
-    strncpy(item.container_id, parg->container_id, CONTAINER_ID_LEN - 1);
+    snprintf(item.container_id, sizeof(item.container_id), "%s", parg->container_id);
 
     while (1) {
         n = read(parg->pipe_read_fd, item.data, sizeof(item.data));
@@ -550,7 +550,7 @@ int register_with_monitor(int monitor_fd,
     req.pid              = host_pid;
     req.soft_limit_bytes = soft_limit_bytes;
     req.hard_limit_bytes = hard_limit_bytes;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    snprintf(req.container_id, sizeof(req.container_id), "%s", container_id);
     if (ioctl(monitor_fd, MONITOR_REGISTER, &req) < 0)
         return -1;
     return 0;
@@ -563,7 +563,7 @@ int unregister_from_monitor(int monitor_fd,
     struct monitor_request req;
     memset(&req, 0, sizeof(req));
     req.pid = host_pid;
-    strncpy(req.container_id, container_id, sizeof(req.container_id) - 1);
+    snprintf(req.container_id, sizeof(req.container_id), "%s", container_id);
     if (ioctl(monitor_fd, MONITOR_UNREGISTER, &req) < 0)
         return -1;
     return 0;
@@ -613,9 +613,9 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
 
     /* Build child configuration. */
     memset(&cfg, 0, sizeof(cfg));
-    strncpy(cfg.id,      req->container_id, CONTAINER_ID_LEN - 1);
-    strncpy(cfg.rootfs,  req->rootfs,       PATH_MAX - 1);
-    strncpy(cfg.command, req->command,      CHILD_COMMAND_LEN - 1);
+    snprintf(cfg.id,      sizeof(cfg.id),      "%s", req->container_id);
+    snprintf(cfg.rootfs,  sizeof(cfg.rootfs),  "%s", req->rootfs);
+    snprintf(cfg.command, sizeof(cfg.command), "%s", req->command);
     cfg.nice_value   = req->nice_value;
     cfg.log_write_fd = log_pipe[1];
 
@@ -652,7 +652,7 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
     record = calloc(1, sizeof(*record));
     if (!record) goto err;
 
-    strncpy(record->id, req->container_id, CONTAINER_ID_LEN - 1);
+    snprintf(record->id, sizeof(record->id), "%s", req->container_id);
     record->host_pid         = child_pid;
     record->started_at       = time(NULL);
     record->state            = CONTAINER_RUNNING;
@@ -673,7 +673,7 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
 
     parg->pipe_read_fd = log_pipe[0];
     parg->log_buffer   = &ctx->log_buffer;
-    strncpy(parg->container_id, req->container_id, CONTAINER_ID_LEN - 1);
+    snprintf(parg->container_id, sizeof(parg->container_id), "%s", req->container_id);
 
     if (pthread_create(&record->producer_tid, NULL,
                        producer_thread, parg) != 0) {
@@ -793,7 +793,8 @@ static void reap_children(supervisor_ctx_t *ctx)
             snprintf(resp.message, sizeof(resp.message),
                      "container '%s' exited state=%s",
                      r->id, state_to_string(r->state));
-            write(run_fd, &resp, sizeof(resp));
+            ssize_t wb = write(run_fd, &resp, sizeof(resp));
+            (void)wb;
             close(run_fd);
         }
 
@@ -914,7 +915,7 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *r = find_by_id(ctx, req.container_id);
         if (r) {
-            strncpy(log_path, r->log_path, PATH_MAX - 1);
+            snprintf(log_path, sizeof(log_path), "%s", r->log_path);
             found = 1;
         }
         pthread_mutex_unlock(&ctx->metadata_lock);

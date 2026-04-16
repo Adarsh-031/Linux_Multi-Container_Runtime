@@ -1,11 +1,13 @@
 /*
  * engine.c - Supervised Multi-Container Runtime (User Space)
  *
- * Full implementation of all TODO sections from the src.
+ * Based on the complete implementation from the project submission,
+ * extended with a user-space Round Robin scheduler for comparison
+ * against Linux CFS.
  *
  * Architecture:
- *   - Supervisor daemon: UNIX domain socket for control plane (Path B),
- *     per-container pipes for logging (Path A).
+ *   - Supervisor daemon: UNIX domain socket for control plane,
+ *     per-container pipes for logging.
  *   - One producer thread per container reads the log pipe and pushes
  *     chunks into the shared bounded buffer.
  *   - One global consumer (logging_thread) drains the buffer and writes
@@ -14,6 +16,10 @@
  *     control_request_t, and read back a control_response_t.
  *   - CMD_RUN keeps the client socket open; reap_children() replies
  *     and closes it when the container exits.
+ *
+ * Scheduler modes (new):
+ *   cfs  - Linux native CFS via nice values (default)
+ *   rr   - User-space Round Robin via SIGSTOP / SIGCONT + quantum timer
  */
 
 #define _GNU_SOURCE
@@ -53,6 +59,7 @@
 #define LOG_BUFFER_CAPACITY 16
 #define DEFAULT_SOFT_LIMIT  (40UL << 20)   /* 40 MiB */
 #define DEFAULT_HARD_LIMIT  (64UL << 20)   /* 64 MiB */
+#define DEFAULT_QUANTUM_MS  500            /* RR time quantum */
 
 /* ------------------------------------------------------------------ */
 /* Enums                                                               */
@@ -69,21 +76,26 @@ typedef enum {
 typedef enum {
     CONTAINER_STARTING = 0,
     CONTAINER_RUNNING,
-    CONTAINER_STOPPED,
-    CONTAINER_KILLED,   /* hard-limit kill by the kernel monitor */
+    CONTAINER_PAUSED,    /* RR mode: suspended via SIGSTOP             */
+    CONTAINER_STOPPED,   /* user-requested stop                        */
+    CONTAINER_KILLED,    /* hard-limit kill by the kernel monitor      */
     CONTAINER_EXITED
 } container_state_t;
+
+typedef enum {
+    SCHED_MODE_CFS = 0,
+    SCHED_MODE_RR
+} scheduler_mode_t;
 
 /* ------------------------------------------------------------------ */
 /* container_record_t                                                  */
 /*                                                                     */
-/* Extended from the src to include:                           */
-/*   stop_requested  - set before SIGTERM so reap_children can         */
-/*                     distinguish a manual stop from a hard-limit kill */
-/*   log_pipe_read_fd - supervisor's end of the per-container log pipe */
-/*   producer_tid    - thread that drains the log pipe into the buffer */
-/*   run_client_fd   - socket to reply on when container exits (-1 if  */
-/*                     this container was started with CMD_START)       */
+/* stop_requested  - set before SIGTERM so reap_children can          */
+/*                   distinguish a manual stop from a hard-limit kill  */
+/* log_pipe_read_fd - supervisor's end of the per-container log pipe  */
+/* producer_tid    - thread that drains the log pipe into the buffer  */
+/* run_client_fd   - socket to reply on when container exits (-1 if   */
+/*                   this container was started with CMD_START)        */
 /* ------------------------------------------------------------------ */
 typedef struct container_record {
     char               id[CONTAINER_ID_LEN];
@@ -107,7 +119,7 @@ typedef struct container_record {
 } container_record_t;
 
 /* ------------------------------------------------------------------ */
-/* Other types (unchanged from src)                            */
+/* Other types                                                         */
 /* ------------------------------------------------------------------ */
 typedef struct {
     char   container_id[CONTAINER_ID_LEN];
@@ -160,8 +172,15 @@ typedef struct {
     int                server_fd;
     int                monitor_fd;
     int                should_stop;
+    /* scheduler */
+    scheduler_mode_t   scheduler_mode;
+    unsigned int       quantum_ms;
+    pthread_t          rr_thread;
+    container_record_t *rr_current;   /* container currently holding CPU in RR */
+    /* logging */
     pthread_t          logger_thread;
     bounded_buffer_t   log_buffer;
+    /* metadata */
     pthread_mutex_t    metadata_lock;
     container_record_t *containers;
     char               base_rootfs[PATH_MAX];
@@ -177,13 +196,13 @@ static void handle_sigchld(int sig) { (void)sig; g_sigchld_pending = 1; }
 static void handle_stop(int sig)    { (void)sig; g_stop_pending    = 1; }
 
 /* ------------------------------------------------------------------ */
-/* Usage / parsing helpers (unchanged from src)               */
+/* Usage / parsing helpers                                             */
 /* ------------------------------------------------------------------ */
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s supervisor <base-rootfs>\n"
+        "  %s supervisor <base-rootfs> [--scheduler cfs|rr] [--quantum N]\n"
         "  %s start <id> <container-rootfs> <command>"
             " [--soft-mib N] [--hard-mib N] [--nice N]\n"
         "  %s run <id> <container-rootfs> <command>"
@@ -266,6 +285,7 @@ static const char *state_to_string(container_state_t state)
     switch (state) {
     case CONTAINER_STARTING: return "starting";
     case CONTAINER_RUNNING:  return "running";
+    case CONTAINER_PAUSED:   return "paused";
     case CONTAINER_STOPPED:  return "stopped";
     case CONTAINER_KILLED:   return "killed";
     case CONTAINER_EXITED:   return "exited";
@@ -276,14 +296,11 @@ static const char *state_to_string(container_state_t state)
 /* ================================================================== */
 /* Bounded Buffer                                                      */
 /*                                                                     */
-/* Classic producer-consumer ring buffer guarded by one mutex and     */
-/* two condition variables (not_empty, not_full).                      */
-/*                                                                     */
 /* A mutex is correct here because:                                    */
 /*   - push() calls pthread_cond_wait(), which requires sleeping.      */
 /*   - Spinlocks cannot be held across a sleep.                        */
-/*   - The critical section is short (a struct copy), so the mutex     */
-/*     contention overhead is negligible.                              */
+/*   - The critical section is short (a struct copy), so contention    */
+/*     overhead is negligible.                                         */
 /* ================================================================== */
 static int bounded_buffer_init(bounded_buffer_t *buffer)
 {
@@ -320,16 +337,12 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
 
 /*
  * bounded_buffer_push
- *
- * Blocks while the buffer is full.  Returns -1 if the buffer is
- * shutting down so the producer thread can exit cleanly.
- * Wakes one consumer after inserting.
+ * Blocks while full; returns -1 if shutdown begins while waiting.
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
     pthread_mutex_lock(&buffer->mutex);
 
-    /* Wait while full, but bail out if shutdown begins. */
     while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
         pthread_cond_wait(&buffer->not_full, &buffer->mutex);
 
@@ -349,10 +362,7 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 
 /*
  * bounded_buffer_pop
- *
- * Blocks while the buffer is empty.  Returns 0 on success, 1 when
- * the buffer is being shut down AND is empty (consumer should exit).
- * Wakes one producer after removing.
+ * Blocks while empty. Returns 0 on success, 1 when shutdown + empty.
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
@@ -380,8 +390,8 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 /*                                                                     */
 /* Drains log_item_t chunks from the shared bounded buffer and        */
 /* appends each chunk to the correct per-container log file.          */
-/* Continues draining until shutdown is signalled AND the buffer is   */
-/* empty, so no output is lost on abrupt container exit.              */
+/* Continues draining until shutdown is signalled AND buffer is empty */
+/* so no output is lost on abrupt container exit.                     */
 /* ================================================================== */
 void *logging_thread(void *arg)
 {
@@ -422,12 +432,7 @@ void *logging_thread(void *arg)
 /*                                                                     */
 /* Reads raw bytes from the container's stdout/stderr pipe and        */
 /* inserts them as log_item_t chunks into the shared bounded buffer.  */
-/* Exits naturally when read() returns 0 (child closed the write end  */
-/* of the pipe, i.e., the container process exited).                  */
-/*                                                                     */
-/* Because this thread drains the pipe to EOF before exiting, all     */
-/* output produced before the container died is captured even if the  */
-/* container exits abruptly.                                          */
+/* Exits naturally when read() returns 0 (child closed write end).    */
 /* ================================================================== */
 static void *producer_thread(void *arg)
 {
@@ -436,7 +441,8 @@ static void *producer_thread(void *arg)
     ssize_t         n;
 
     memset(&item, 0, sizeof(item));
-    snprintf(item.container_id, sizeof(item.container_id), "%s", parg->container_id);
+    snprintf(item.container_id, sizeof(item.container_id),
+             "%s", parg->container_id);
 
     while (1) {
         n = read(parg->pipe_read_fd, item.data, sizeof(item.data));
@@ -508,10 +514,9 @@ int child_fn(void *arg)
     }
 
     /*
-     * Mount /proc inside the container so that utilities that inspect
-     * /proc (ps, top, cat /proc/meminfo, etc.) work correctly.
-     * The child is in a fresh mount namespace (CLONE_NEWNS) so this
-     * mount is invisible to the host and to other containers.
+     * Mount /proc inside the container so utilities that inspect
+     * /proc work correctly. The child is in a fresh mount namespace
+     * (CLONE_NEWNS) so this mount is invisible to the host.
      */
     if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
         fprintf(stderr,
@@ -528,10 +533,9 @@ int child_fn(void *arg)
     }
 
     /* Execute the command. */
-    char *argv[] = { "/bin/sh", "-c", cfg->command, NULL };
-    execv("/bin/sh", argv);
+    char *argv_exec[] = { "/bin/sh", "-c", cfg->command, NULL };
+    execv("/bin/sh", argv_exec);
 
-    /* execv only returns on error. */
     fprintf(stderr, "[container] execv failed: %s\n", strerror(errno));
     return 1;
 }
@@ -576,7 +580,8 @@ int unregister_from_monitor(int monitor_fd,
 /* starts a producer thread, registers the child with the kernel      */
 /* monitor, and appends the container_record to the supervisor list.  */
 /*                                                                     */
-/* Returns a pointer to the new record on success, NULL on failure.   */
+/* RR mode: newly spawned containers start SIGSTOP'd; the RR thread   */
+/* decides when to give them the CPU.                                  */
 /* ================================================================== */
 static container_record_t *start_container(supervisor_ctx_t *ctx,
                                            const control_request_t *req)
@@ -635,11 +640,6 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
         goto err;
     }
 
-    /*
-     * Parent closes the write end of the pipe.  Once the child (and
-     * all its descendants) exit, the write end is fully closed and
-     * the producer thread gets EOF.
-     */
     close(log_pipe[1]);
     log_pipe[1] = -1;
 
@@ -655,7 +655,6 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
     snprintf(record->id, sizeof(record->id), "%s", req->container_id);
     record->host_pid         = child_pid;
     record->started_at       = time(NULL);
-    record->state            = CONTAINER_RUNNING;
     record->soft_limit_bytes = req->soft_limit_bytes;
     record->hard_limit_bytes = req->hard_limit_bytes;
     record->exit_code        = -1;
@@ -667,13 +666,32 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
     snprintf(record->log_path, sizeof(record->log_path),
              "%s/%s.log", LOG_DIR, req->container_id);
 
+    /*
+     * RR mode: immediately SIGSTOP the new child.
+     * The RR thread decides when it actually gets the CPU.
+     * CFS mode: let Linux schedule it freely.
+     */
+    if (ctx->scheduler_mode == SCHED_MODE_RR) {
+        kill(child_pid, SIGSTOP);
+        record->state = CONTAINER_PAUSED;
+        /* If no container is running yet, give CPU to this one immediately. */
+        if (!ctx->rr_current) {
+            kill(child_pid, SIGCONT);
+            record->state   = CONTAINER_RUNNING;
+            ctx->rr_current = record;
+        }
+    } else {
+        record->state = CONTAINER_RUNNING;
+    }
+
     /* Start the producer thread for this container's log pipe. */
     parg = malloc(sizeof(*parg));
     if (!parg) goto err;
 
     parg->pipe_read_fd = log_pipe[0];
     parg->log_buffer   = &ctx->log_buffer;
-    snprintf(parg->container_id, sizeof(parg->container_id), "%s", req->container_id);
+    snprintf(parg->container_id, sizeof(parg->container_id),
+             "%s", req->container_id);
 
     if (pthread_create(&record->producer_tid, NULL,
                        producer_thread, parg) != 0) {
@@ -682,7 +700,6 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
         goto err;
     }
     record->producer_started = 1;
-    /* parg is freed by producer_thread before it returns. */
 
     /* Register the container's host PID with the kernel monitor. */
     if (ctx->monitor_fd >= 0) {
@@ -704,8 +721,9 @@ static container_record_t *start_container(supervisor_ctx_t *ctx,
     pthread_mutex_unlock(&ctx->metadata_lock);
 
     fprintf(stderr,
-            "[supervisor] Started container '%s' pid=%d command='%s'\n",
-            record->id, record->host_pid, req->command);
+            "[supervisor] Started container '%s' pid=%d command='%s' scheduler=%s\n",
+            record->id, record->host_pid, req->command,
+            ctx->scheduler_mode == SCHED_MODE_RR ? "RR" : "CFS");
     return record;
 
 err:
@@ -722,12 +740,13 @@ err:
 /* Called whenever SIGCHLD is detected in the event loop.             */
 /* Uses waitpid(-1, WNOHANG) to collect all exited children.          */
 /*                                                                     */
-/* For each reaped child:                                             */
+/* For each reaped child:                                              */
 /*   - Updates container state and exit information.                  */
 /*   - Classifies termination (exited / stopped / hard-limit killed). */
 /*   - Joins the producer thread so its pipe is fully drained.        */
 /*   - Unregisters the PID from the kernel monitor.                   */
 /*   - Replies to any blocked CMD_RUN client and closes its socket.   */
+/*   - Clears rr_current if the RR container exited.                  */
 /* ================================================================== */
 static void reap_children(supervisor_ctx_t *ctx)
 {
@@ -750,9 +769,9 @@ static void reap_children(supervisor_ctx_t *ctx)
             r->exit_signal = WTERMSIG(wstatus);
             r->exit_code   = -1;
             /*
-             * Termination classification (Task 4 requirement):
+             * Termination classification:
              *   stop_requested=1 AND signal → STOPPED (manual stop)
-             *   stop_requested=0 AND SIGKILL → KILLED (hard-limit kill)
+             *   stop_requested=0 AND SIGKILL → KILLED (hard-limit)
              *   anything else signaled        → STOPPED
              */
             if (r->stop_requested) {
@@ -764,6 +783,10 @@ static void reap_children(supervisor_ctx_t *ctx)
             }
         }
 
+        /* If the RR-current container exited, clear the pointer. */
+        if (ctx->rr_current == r)
+            ctx->rr_current = NULL;
+
         int run_fd = r->run_client_fd;
         r->run_client_fd = -1;
 
@@ -774,11 +797,11 @@ static void reap_children(supervisor_ctx_t *ctx)
             unregister_from_monitor(ctx->monitor_fd, r->id, pid);
 
         /*
-         * Join the producer thread.  Because the child's write end of
+         * Join the producer thread. Because the child's write end of
          * the pipe is now closed, the producer will read EOF, flush
          * any remaining data into the bounded buffer, and exit.
-         * Joining here guarantees all log output is captured before we
-         * reply to a CMD_RUN client.
+         * Joining here guarantees all log output is captured before
+         * we reply to a CMD_RUN client.
          */
         if (r->producer_started)
             pthread_join(r->producer_tid, NULL);
@@ -802,6 +825,77 @@ static void reap_children(supervisor_ctx_t *ctx)
                 "[supervisor] Reaped container '%s' pid=%d state=%s\n",
                 r->id, pid, state_to_string(r->state));
     }
+}
+
+/* ================================================================== */
+/* rr_scheduler_thread  (new - Round Robin mode only)                  */
+/*                                                                     */
+/* Every quantum_ms milliseconds:                                      */
+/*   1. SIGSTOP the currently running container.                       */
+/*   2. Find the next eligible container in list order (wrap-around).  */
+/*   3. SIGCONT it and update rr_current.                              */
+/*                                                                     */
+/* Design: mutex (not spinlock) because cond_wait is used in the      */
+/* bounded buffer and the critical section never sleeps under the      */
+/* lock — sleep happens outside (usleep) between ticks.               */
+/* ================================================================== */
+static void *rr_scheduler_thread(void *arg)
+{
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+
+    while (!ctx->should_stop) {
+        usleep(ctx->quantum_ms * 1000U);
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+
+        /* Search for the next eligible container after rr_current. */
+        container_record_t *next = NULL;
+        container_record_t *p;
+
+        /* First pass: from rr_current->next to end of list. */
+        p = ctx->rr_current ? ctx->rr_current->next : ctx->containers;
+        while (p) {
+            if (p->state == CONTAINER_RUNNING ||
+                p->state == CONTAINER_PAUSED) {
+                next = p;
+                break;
+            }
+            p = p->next;
+        }
+
+        /* Wrap-around: from head up to (not including) rr_current. */
+        if (!next) {
+            p = ctx->containers;
+            while (p && p != ctx->rr_current) {
+                if (p->state == CONTAINER_RUNNING ||
+                    p->state == CONTAINER_PAUSED) {
+                    next = p;
+                    break;
+                }
+                p = p->next;
+            }
+        }
+
+        if (next && next != ctx->rr_current) {
+            /* Pause whoever currently holds the CPU. */
+            if (ctx->rr_current &&
+                ctx->rr_current->state == CONTAINER_RUNNING) {
+                kill(ctx->rr_current->host_pid, SIGSTOP);
+                ctx->rr_current->state = CONTAINER_PAUSED;
+            }
+            /* Hand the CPU to the next container. */
+            if (next->state == CONTAINER_PAUSED) {
+                kill(next->host_pid, SIGCONT);
+                next->state = CONTAINER_RUNNING;
+            }
+            ctx->rr_current = next;
+        } else if (!next) {
+            ctx->rr_current = NULL;
+        }
+
+        pthread_mutex_unlock(&ctx->metadata_lock);
+    }
+    return NULL;
 }
 
 /* ================================================================== */
@@ -859,12 +953,11 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         }
         /*
          * Store the client fd.  reap_children() will send the response
-         * and close it when the container exits.
+         * and close it when the container exits.  Do NOT close here.
          */
         pthread_mutex_lock(&ctx->metadata_lock);
         r->run_client_fd = client_fd;
         pthread_mutex_unlock(&ctx->metadata_lock);
-        /* Do NOT close client_fd here. */
         break;
     }
 
@@ -874,7 +967,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
         snprintf(resp.message, sizeof(resp.message), "Container list:");
         send(client_fd, &resp, sizeof(resp), 0);
 
-        /* Send the PS table as plain text after the response struct. */
         char line[512];
         int  len;
         len = snprintf(line, sizeof(line),
@@ -934,7 +1026,6 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
                  "Log for container '%s':", req.container_id);
         send(client_fd, &resp, sizeof(resp), 0);
 
-        /* Stream the log file contents to the client. */
         int logfd = open(log_path, O_RDONLY);
         if (logfd >= 0) {
             char buf[4096];
@@ -953,13 +1044,12 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
 
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *r = find_by_id(ctx, req.container_id);
-        if (r && r->state == CONTAINER_RUNNING) {
-            /*
-             * Set stop_requested BEFORE sending SIGTERM so that
-             * reap_children() can classify this as STOPPED rather
-             * than KILLED if the signal is SIGKILL-equivalent.
-             */
+        if (r && (r->state == CONTAINER_RUNNING ||
+                  r->state == CONTAINER_PAUSED)) {
             r->stop_requested = 1;
+            /* Un-pause first so SIGTERM can be delivered. */
+            if (r->state == CONTAINER_PAUSED)
+                kill(r->host_pid, SIGCONT);
             kill(r->host_pid, SIGTERM);
             found_running = 1;
         }
@@ -994,23 +1084,32 @@ static void handle_client(supervisor_ctx_t *ctx, int client_fd)
 /* supervisor_shutdown                                                 */
 /*                                                                     */
 /* Orderly teardown:                                                   */
-/*   1. SIGTERM all running containers.                                */
-/*   2. Wait up to 3 s; SIGKILL survivors.                            */
-/*   3. Drain remaining children via reap_children().                 */
-/*   4. Signal the log pipeline to drain and stop.                    */
-/*   5. Join the logger thread.                                        */
-/*   6. Free container records.                                        */
+/*   1. Stop RR scheduler thread (if running).                        */
+/*   2. SIGTERM all running/paused containers.                        */
+/*   3. Wait up to 3 s; SIGKILL survivors.                            */
+/*   4. Drain remaining children via reap_children().                 */
+/*   5. Signal the log pipeline to drain and stop.                    */
+/*   6. Join the logger thread.                                        */
+/*   7. Free container records.                                        */
 /* ================================================================== */
 static void supervisor_shutdown(supervisor_ctx_t *ctx)
 {
     fprintf(stderr, "[supervisor] Initiating orderly shutdown...\n");
 
-    /* Signal all running containers. */
+    /* Stop the RR thread before touching container states. */
+    if (ctx->scheduler_mode == SCHED_MODE_RR) {
+        ctx->should_stop = 1;
+        pthread_join(ctx->rr_thread, NULL);
+    }
+
+    /* Signal all running/paused containers. */
     pthread_mutex_lock(&ctx->metadata_lock);
     container_record_t *r = ctx->containers;
     while (r) {
-        if (r->state == CONTAINER_RUNNING) {
+        if (r->state == CONTAINER_RUNNING || r->state == CONTAINER_PAUSED) {
             r->stop_requested = 1;
+            if (r->state == CONTAINER_PAUSED)
+                kill(r->host_pid, SIGCONT);
             kill(r->host_pid, SIGTERM);
         }
         r = r->next;
@@ -1024,17 +1123,18 @@ static void supervisor_shutdown(supervisor_ctx_t *ctx)
         int any_running = 0;
         pthread_mutex_lock(&ctx->metadata_lock);
         for (r = ctx->containers; r; r = r->next)
-            if (r->state == CONTAINER_RUNNING) { any_running = 1; break; }
+            if (r->state == CONTAINER_RUNNING ||
+                r->state == CONTAINER_PAUSED) { any_running = 1; break; }
         pthread_mutex_unlock(&ctx->metadata_lock);
         if (!any_running) break;
         sleep(1);
         waited++;
     }
 
-    /* Force-kill any that survived the grace period. */
+    /* Force-kill any survivors. */
     pthread_mutex_lock(&ctx->metadata_lock);
     for (r = ctx->containers; r; r = r->next)
-        if (r->state == CONTAINER_RUNNING)
+        if (r->state == CONTAINER_RUNNING || r->state == CONTAINER_PAUSED)
             kill(r->host_pid, SIGKILL);
     pthread_mutex_unlock(&ctx->metadata_lock);
 
@@ -1067,10 +1167,13 @@ static void supervisor_shutdown(supervisor_ctx_t *ctx)
 /*   1. Open /dev/container_monitor.                                   */
 /*   2. Bind the UNIX domain control socket.                          */
 /*   3. Install SIGCHLD / SIGINT / SIGTERM handlers.                  */
-/*   4. Spawn the logging consumer thread.                            */
-/*   5. Event loop: accept clients, check signal flags.               */
+/*   4. Spawn logging consumer thread.                                 */
+/*   5. Spawn RR scheduler thread (if requested).                     */
+/*   6. Event loop: select() on socket, check signal flags.           */
 /* ================================================================== */
-static int run_supervisor(const char *rootfs)
+static int run_supervisor(const char *rootfs,
+                           scheduler_mode_t mode,
+                           unsigned int quantum_ms)
 {
     supervisor_ctx_t   ctx;
     struct sockaddr_un addr;
@@ -1078,8 +1181,10 @@ static int run_supervisor(const char *rootfs)
     int                rc;
 
     memset(&ctx, 0, sizeof(ctx));
-    ctx.server_fd  = -1;
-    ctx.monitor_fd = -1;
+    ctx.server_fd      = -1;
+    ctx.monitor_fd     = -1;
+    ctx.scheduler_mode = mode;
+    ctx.quantum_ms     = quantum_ms ? quantum_ms : DEFAULT_QUANTUM_MS;
     strncpy(ctx.base_rootfs, rootfs, PATH_MAX - 1);
 
     /* Metadata mutex. */
@@ -1116,10 +1221,16 @@ static int run_supervisor(const char *rootfs)
     if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); goto fail;
     }
+    chmod(CONTROL_PATH, 0666);   /* allow non-root clients */
     if (listen(ctx.server_fd, 8) < 0) { perror("listen"); goto fail; }
 
     fprintf(stderr, "[supervisor] Control socket: %s\n", CONTROL_PATH);
     fprintf(stderr, "[supervisor] Base rootfs:    %s\n", rootfs);
+    fprintf(stderr, "[supervisor] Scheduler:      %s",
+            mode == SCHED_MODE_RR ? "Round Robin" : "CFS");
+    if (mode == SCHED_MODE_RR)
+        fprintf(stderr, " (quantum=%ums)", ctx.quantum_ms);
+    fprintf(stderr, "\n");
 
     /* 3) Signal handlers. */
     memset(&sa, 0, sizeof(sa));
@@ -1140,10 +1251,19 @@ static int run_supervisor(const char *rootfs)
         errno = rc; perror("pthread_create (logger)"); goto fail;
     }
 
+    /* 5) RR scheduler thread (only in RR mode). */
+    if (mode == SCHED_MODE_RR) {
+        rc = pthread_create(&ctx.rr_thread, NULL,
+                            rr_scheduler_thread, &ctx);
+        if (rc != 0) {
+            errno = rc; perror("pthread_create (rr_scheduler)"); goto fail;
+        }
+    }
+
     fprintf(stderr,
             "[supervisor] Running. Send SIGINT or SIGTERM to shut down.\n");
 
-    /* 5) Event loop. */
+    /* 6) Event loop. */
     while (!ctx.should_stop && !g_stop_pending) {
         fd_set         rfds;
         struct timeval tv = { 1, 0 };   /* 1 s timeout to check flags */
@@ -1185,10 +1305,6 @@ fail:
 
 /* ================================================================== */
 /* send_control_request  (client side)                                 */
-/*                                                                     */
-/* Connects to the supervisor's UNIX domain socket, sends the         */
-/* control_request_t, reads back the control_response_t, then reads  */
-/* any trailing text data (PS table, log contents, or RUN reply).     */
 /* ================================================================== */
 static int send_control_request(const control_request_t *req)
 {
@@ -1330,10 +1446,36 @@ int main(int argc, char *argv[])
 
     if (strcmp(argv[1], "supervisor") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s supervisor <base-rootfs>\n", argv[0]);
+            fprintf(stderr,
+                    "Usage: %s supervisor <base-rootfs>"
+                    " [--scheduler cfs|rr] [--quantum N]\n", argv[0]);
             return 1;
         }
-        return run_supervisor(argv[2]);
+
+        const char      *rootfs  = argv[2];
+        scheduler_mode_t mode    = SCHED_MODE_CFS;
+        unsigned int     quantum = DEFAULT_QUANTUM_MS;
+
+        for (int i = 3; i < argc; i += 2) {
+            if (i + 1 >= argc) { usage(argv[0]); return 1; }
+            if (strcmp(argv[i], "--scheduler") == 0) {
+                if (strcmp(argv[i+1], "rr") == 0)
+                    mode = SCHED_MODE_RR;
+                else if (strcmp(argv[i+1], "cfs") == 0)
+                    mode = SCHED_MODE_CFS;
+                else {
+                    fprintf(stderr, "Unknown scheduler: %s\n", argv[i+1]);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--quantum") == 0) {
+                char *e;
+                quantum = (unsigned int)strtoul(argv[i+1], &e, 10);
+            } else {
+                fprintf(stderr, "Unknown supervisor flag: %s\n", argv[i]);
+                return 1;
+            }
+        }
+        return run_supervisor(rootfs, mode, quantum);
     }
 
     if (strcmp(argv[1], "start") == 0) return cmd_start(argc, argv);

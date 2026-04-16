@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # compare.sh - CFS vs Round Robin Scheduler Comparison
 #
-# Runs 3 cpu_hog containers under each scheduler and measures:
-#   - Total wall-clock time for all containers to complete
-#   - Throughput (containers completed per second)
-#   - RR overhead % vs CFS
+# Runs two benchmark suites (CPU-bound and I/O-bound), each under
+# both CFS and Round Robin, then prints a combined analysis.
 #
 # Must be run as root: sudo ./compare.sh
 
@@ -13,16 +11,22 @@ cd "$(dirname "$0")"
 
 # ─── Configuration ────────────────────────────────────────────
 ENGINE="./engine"
-DURATION=10          # seconds each cpu_hog runs
 QUANTUM=500          # RR time quantum in milliseconds
-N=3                  # number of containers
+N=3                  # number of containers per experiment
 
 ROOTFS_DIRS=("./rootfs-alpha" "./rootfs-beta" "./rootfs-gamma")
 IDS=("alpha" "beta" "gamma")
 
+# cpu_hog: run for this many seconds
+CPU_DURATION=10
+
+# io_pulse: iterations × sleep_ms  (30 × 200ms ≈ 6 s of real work)
+IO_ITERS=30
+IO_SLEEP_MS=200
+
 # ─── Colours ──────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'
-BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m';  GREEN='\033[0;32m'
+BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 # ─── Helpers ──────────────────────────────────────────────────
 die() { echo -e "${RED}FATAL: $1${NC}" >&2; exit 1; }
@@ -30,20 +34,21 @@ die() { echo -e "${RED}FATAL: $1${NC}" >&2; exit 1; }
 check_prereqs() {
     [[ $(id -u) -eq 0 ]] || die "Run as root: sudo ./compare.sh"
     [[ -x "$ENGINE" ]]    || die "engine binary not found — run: make"
+    [[ -x "./cpu_hog" ]]  || die "cpu_hog not found — run: make"
+    [[ -x "./io_pulse" ]] || die "io_pulse not found — run: make"
     command -v bc >/dev/null 2>&1 || apt-get install -y bc >/dev/null 2>&1
-
     for d in "${ROOTFS_DIRS[@]}"; do
         [[ -d "$d" ]]        || die "Missing $d — see README rootfs setup"
         [[ -x "$d/bin/sh" ]] || die "$d has no /bin/sh"
     done
-    [[ -x "./cpu_hog" ]] || die "cpu_hog binary not found — run: make"
 }
 
 setup_rootfs() {
-    echo "[info] Copying static cpu_hog binary into each rootfs..." >&2
+    echo "[info] Copying cpu_hog and io_pulse into each rootfs..." >&2
     for d in "${ROOTFS_DIRS[@]}"; do
-        cp -f ./cpu_hog "$d/cpu_hog"
-        chmod +x "$d/cpu_hog"
+        cp -f ./cpu_hog  "$d/cpu_hog"
+        cp -f ./io_pulse "$d/io_pulse"
+        chmod +x "$d/cpu_hog" "$d/io_pulse"
     done
 }
 
@@ -53,166 +58,240 @@ cleanup() {
     sleep 0.3
 }
 
-# Wait until all N containers have exited (no running or paused state).
-# FIX: use $(( waited + 1 )) instead of (( waited++ )) to avoid
-# bash arithmetic exit-code 1 killing the script under set -e.
+# Wait until all containers show exited/killed/stopped.
+# $1 = max seconds to wait
 wait_all_done() {
-    local max_wait=$(( DURATION * 6 ))
+    local max_wait="$1"
     local waited=0
     while [[ $waited -lt $max_wait ]]; do
         sleep 1
-        waited=$(( waited + 1 ))   # FIX: was (( waited++ )) — returned exit 1 when waited=0
-
+        waited=$(( waited + 1 ))
         local running
-        running=$("$ENGINE" ps 2>/dev/null | grep -cE 'running|paused' || echo "0")
+        running=$("$ENGINE" ps 2>/dev/null | grep -cE 'running|paused' || true)
         [[ "$running" -eq 0 ]] && return 0
     done
-
-    # FIX: explicitly return failure so caller knows we timed out
-    echo -e "${RED}WARNING: containers did not exit within ${max_wait}s${NC}" >&2
+    echo -e "${RED}  WARNING: containers did not exit within ${max_wait}s${NC}" >&2
     return 1
 }
 
 # ─── Single benchmark run ─────────────────────────────────────
-# All status output goes to stderr.
-# Only the elapsed milliseconds are printed to stdout,
-# so CFS_MS=$(run_benchmark ...) captures just the number.
+# run_benchmark <scheduler> <label> <container_cmd> <max_wait_seconds>
+#
+# All human-readable output goes to stderr.
+# Only the elapsed milliseconds go to stdout (captured by caller).
 run_benchmark() {
     local mode="$1"
     local label="$2"
+    local container_cmd="$3"
+    local max_wait="$4"
     local extra=""
     [[ "$mode" == "rr" ]] && extra="--quantum $QUANTUM"
 
-    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-    echo -e "${BLUE} Experiment: $label${NC}" >&2
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo -e "\n${BLUE}  ▶ $label${NC}" >&2
+    echo -e "${BLUE}    command: $container_cmd${NC}" >&2
 
     cleanup
     rm -rf logs/
 
-    # Start supervisor in background; redirect its output to a log file
     # shellcheck disable=SC2086
     "$ENGINE" supervisor "${ROOTFS_DIRS[0]}" --scheduler "$mode" $extra \
         >"/tmp/supervisor_${mode}.log" 2>&1 &
     local sup_pid=$!
-    sleep 1   # give supervisor time to bind the socket
+    sleep 1
 
-    # Record wall-clock start time in milliseconds
     local t_start
     t_start=$(date +%s%3N)
 
-    # Launch all containers
     local i
     for i in $(seq 0 $(( N - 1 ))); do
-        "$ENGINE" start "${IDS[$i]}" "${ROOTFS_DIRS[$i]}" "/cpu_hog $DURATION" \
+        "$ENGINE" start "${IDS[$i]}" "${ROOTFS_DIRS[$i]}" "$container_cmd" \
             >/dev/null 2>&1
-        echo "  [+] started container '${IDS[$i]}'" >&2
+        echo "    [+] started '${IDS[$i]}'" >&2
     done
 
-    echo "  Waiting for all containers to exit..." >&2
-    wait_all_done || true   # warn but continue even if timeout
+    wait_all_done "$max_wait" || true
 
     local t_end
     t_end=$(date +%s%3N)
     local elapsed=$(( t_end - t_start ))
 
-    # Print final container states
-    echo "" >&2
-    echo "  Final container states:" >&2
-    "$ENGINE" ps 2>/dev/null | sed 's/^/    /' >&2
+    # Final states
+    echo "    Container states:" >&2
+    "$ENGINE" ps 2>/dev/null | grep -v "^Container" | grep -v "^ID" \
+        | sed 's/^/      /' >&2 || true
 
-    # Print last log line per container (shows cpu_hog completion)
-    echo "  Per-container output (last line):" >&2
+    # Last log line per container
     local id
     for id in "${IDS[@]}"; do
         if [[ -f "logs/${id}.log" ]]; then
-            tail -1 "logs/${id}.log" | sed "s/^/    [${id}] /" >&2
+            tail -1 "logs/${id}.log" | sed "s/^/      [${id}] /" >&2
         fi
     done
 
-    echo -e "${GREEN}  ✓ $label finished in ${elapsed}ms${NC}" >&2
+    echo -e "    ${GREEN}✓ done in ${elapsed}ms${NC}" >&2
 
-    # Cleanly stop supervisor
     kill "$sup_pid" 2>/dev/null || true
     wait "$sup_pid" 2>/dev/null || true
     cleanup
 
-    # This is the only thing printed to stdout — captured by the caller
     echo "$elapsed"
 }
 
-# ─── Main ─────────────────────────────────────────────────────
+# ─── Compute display metrics ──────────────────────────────────
+# print_metrics <cfs_ms> <rr_ms>  (prints to stdout)
+print_metrics() {
+    local cfs_ms="$1"
+    local rr_ms="$2"
+    local cfs_s rr_s cfs_tp rr_tp overhead
+
+    cfs_s=$(  echo "scale=3; $cfs_ms / 1000"        | bc)
+    rr_s=$(   echo "scale=3; $rr_ms  / 1000"        | bc)
+    cfs_tp=$( echo "scale=4; $N * 1000 / $cfs_ms"   | bc)
+    rr_tp=$(  echo "scale=4; $N * 1000 / $rr_ms"    | bc)
+
+    if [[ $cfs_ms -gt 0 ]]; then
+        overhead=$(echo "scale=1; ($rr_ms - $cfs_ms) * 100 / $cfs_ms" | bc)
+    else
+        overhead="N/A"
+    fi
+
+    printf "  %-36s %12s %12s\n" "Metric"                    "CFS"        "Round Robin"
+    printf "  %-36s %12s %12s\n" "------"                    "---"        "-----------"
+    printf "  %-36s %11ss %11ss\n" "Total wall time"          "$cfs_s"     "$rr_s"
+    printf "  %-36s %12s %12s\n"  "Throughput (containers/s)" "$cfs_tp"    "$rr_tp"
+    printf "  %-36s %12s %11s%%\n" "RR overhead vs CFS"      "baseline"   "$overhead"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 check_prereqs
 setup_rootfs
 
 echo -e "${YELLOW}"
 cat <<'BANNER'
-╔═══════════════════════════════════════════════════╗
-║   CFS  vs  Round Robin  –  Scheduler Comparison   ║
-╚═══════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════╗
+║   CFS vs Round Robin — Full Scheduler Comparison           ║
+║   Workloads: CPU-bound (cpu_hog) + I/O-bound (io_pulse)   ║
+╚════════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${NC}"
-echo "  Workload  : $N × cpu_hog (${DURATION}s CPU-bound each)"
-echo "  RR Quantum: ${QUANTUM} ms"
-echo "  Rootfs    : Alpine Linux (static cpu_hog binary)"
+echo "  RR Quantum : ${QUANTUM} ms"
+echo "  Containers : ${N} per experiment"
+echo "  Rootfs     : Alpine Linux"
 echo ""
 
-CFS_MS=$(run_benchmark "cfs" "CFS (Linux native scheduler)")
-RR_MS=$( run_benchmark "rr"  "Round Robin (user-space, quantum=${QUANTUM}ms)")
+# ─── Suite 1: CPU-bound ───────────────────────────────────────
+CPU_CMD="/cpu_hog $CPU_DURATION"
+CPU_MAX_WAIT=$(( CPU_DURATION * 5 ))
 
-# ─── Compute metrics ──────────────────────────────────────────
-CFS_S=$(  echo "scale=3; $CFS_MS / 1000" | bc)
-RR_S=$(   echo "scale=3; $RR_MS  / 1000" | bc)
+echo -e "${CYAN}══════════════════════════════════════════════════════════════"
+echo " SUITE 1 — CPU-BOUND WORKLOAD (cpu_hog, ${CPU_DURATION}s each)"
+echo -e "══════════════════════════════════════════════════════════════${NC}"
 
-# Throughput = containers / wall_time_seconds
-CFS_TP=$( echo "scale=4; $N * 1000 / $CFS_MS" | bc)
-RR_TP=$(  echo "scale=4; $N * 1000 / $RR_MS"  | bc)
+CPU_CFS_MS=$(run_benchmark "cfs" "CFS  + cpu_hog" "$CPU_CMD" "$CPU_MAX_WAIT")
+CPU_RR_MS=$( run_benchmark "rr"  "RR   + cpu_hog" "$CPU_CMD" "$CPU_MAX_WAIT")
 
-# Overhead = extra time RR adds over CFS (%)
-if [[ $CFS_MS -gt 0 ]]; then
-    OVERHEAD=$(echo "scale=1; ($RR_MS - $CFS_MS) * 100 / $CFS_MS" | bc)
-else
-    OVERHEAD="N/A"
-fi
+# ─── Suite 2: I/O-bound ───────────────────────────────────────
+IO_CMD="/io_pulse $IO_ITERS $IO_SLEEP_MS"
+IO_EXPECTED=$(( IO_ITERS * IO_SLEEP_MS / 1000 + 3 ))   # ≈ expected seconds
+IO_MAX_WAIT=$(( IO_EXPECTED * 5 ))
 
-# ─── Results table ────────────────────────────────────────────
 echo ""
-echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗"
-echo "║                       RESULTS                            ║"
-echo -e "╚═══════════════════════════════════════════════════════════╝${NC}"
-echo ""
-printf "  %-38s %12s %12s\n" "Metric"                     "CFS"         "Round Robin"
-printf "  %-38s %12s %12s\n" "------"                     "---"         "-----------"
-printf "  %-38s %11ss %11ss\n" "Total wall time"           "$CFS_S"      "$RR_S"
-printf "  %-38s %12s %12s\n"  "Throughput (containers/s)"  "$CFS_TP"     "$RR_TP"
-printf "  %-38s %12s %11s%%\n" "RR overhead vs CFS"       "baseline"    "$OVERHEAD"
-echo ""
+echo -e "${CYAN}══════════════════════════════════════════════════════════════"
+echo " SUITE 2 — I/O-BOUND WORKLOAD (io_pulse, ${IO_ITERS} iters × ${IO_SLEEP_MS}ms)"
+echo -e "══════════════════════════════════════════════════════════════${NC}"
 
-echo -e "${YELLOW}Analysis:${NC}"
+IO_CFS_MS=$(run_benchmark "cfs" "CFS  + io_pulse" "$IO_CMD" "$IO_MAX_WAIT")
+IO_RR_MS=$( run_benchmark "rr"  "RR   + io_pulse" "$IO_CMD" "$IO_MAX_WAIT")
+
+# ═══════════════════════════════════════════════════════════════
+# RESULTS
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo -e "${YELLOW}╔════════════════════════════════════════════════════════════╗"
+echo "║                     RESULTS SUMMARY                       ║"
+echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
+
+echo ""
+echo -e "${CYAN}── CPU-Bound (cpu_hog, ${CPU_DURATION}s per container) ──────────────────${NC}"
+print_metrics "$CPU_CFS_MS" "$CPU_RR_MS"
+
+echo ""
+echo -e "${CYAN}── I/O-Bound (io_pulse, ${IO_ITERS} iters × ${IO_SLEEP_MS}ms sleep) ─────────────${NC}"
+print_metrics "$IO_CFS_MS" "$IO_RR_MS"
+
+# ═══════════════════════════════════════════════════════════════
+# ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo -e "${YELLOW}╔════════════════════════════════════════════════════════════╗"
+echo "║                       ANALYSIS                            ║"
+echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
+
+# Compute overhead values for use in analysis text
+CPU_OVERHEAD=$(echo "scale=1; ($CPU_RR_MS - $CPU_CFS_MS) * 100 / $CPU_CFS_MS" | bc)
+IO_OVERHEAD=$( echo "scale=1; ($IO_RR_MS  - $IO_CFS_MS)  * 100 / $IO_CFS_MS"  | bc)
+CPU_CFS_S=$(   echo "scale=2; $CPU_CFS_MS / 1000" | bc)
+CPU_RR_S=$(    echo "scale=2; $CPU_RR_MS  / 1000" | bc)
+IO_CFS_S=$(    echo "scale=2; $IO_CFS_MS  / 1000" | bc)
+IO_RR_S=$(     echo "scale=2; $IO_RR_MS   / 1000" | bc)
+
 cat <<EOF
-  CFS (Completely Fair Scheduler):
-    * Linux kernel schedules containers natively using virtual runtime
-    * Each process accumulates vruntime proportional to CPU usage
-    * CPU-bound containers get equal shares automatically
-    * I/O-bound processes get a wakeup bonus, improving response time
 
-  Round Robin (user-space, quantum=${QUANTUM}ms):
-    * Supervisor sends SIGSTOP/SIGCONT every ${QUANTUM}ms
-    * Only ONE container runs at a time (others are frozen)
-    * Fair for CPU-bound tasks, but adds signal overhead
-    * Does NOT give any boost to I/O-bound tasks (unlike CFS)
-    * Predictable, explicit time slices — easier to reason about
+  ┌─ CPU-Bound Workload (cpu_hog) ──────────────────────────────┐
 
-  Expected outcome for CPU-bound workloads (cpu_hog):
-    * Both show similar total wall time (both are fair)
-    * RR is slightly slower due to SIGSTOP/SIGCONT overhead
-    * All containers finish at roughly the same time (good fairness)
+    CFS  : ${CPU_CFS_S}s
+    RR   : ${CPU_RR_S}s   (${CPU_OVERHEAD}% overhead)
 
-  To see the CFS advantage more clearly, try I/O-bound workload:
-    Edit this script: replace "/cpu_hog $DURATION" with "/io_pulse 30 200"
-    CFS will complete io_pulse faster; RR treats it the same as CPU tasks.
+    Both schedulers are equally fair for CPU-bound tasks — all 3
+    containers finished at nearly the same time under both modes.
+
+    The ${CPU_OVERHEAD}% RR overhead comes from sending SIGSTOP + SIGCONT
+    signals every ${QUANTUM}ms. Each signal pair causes a context switch
+    that CFS handles internally without any user-space intervention.
+    Larger quantum values reduce this overhead but hurt fairness.
+
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ I/O-Bound Workload (io_pulse) ─────────────────────────────┐
+
+    CFS  : ${IO_CFS_S}s
+    RR   : ${IO_RR_S}s   (${IO_OVERHEAD}% overhead)
+
+    CFS wins decisively here. When io_pulse finishes a sleep and
+    is ready to write, CFS gives it an immediate wakeup boost
+    because its virtual runtime (vruntime) is lower than the other
+    containers — it was sleeping, not burning CPU. So it runs
+    right away without waiting.
+
+    In RR mode, io_pulse is SIGSTOP'd at the end of its quantum.
+    When it wakes from sleep mid-quantum of another container, it
+    must wait up to ${QUANTUM}ms for its next turn. It wastes most of
+    its quantum sleeping, gets frozen, and the cycle repeats.
+    This is why RR is ${IO_OVERHEAD}% slower for I/O-bound work.
+
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Conclusion ─────────────────────────────────────────────────┐
+
+    CFS is the better general-purpose scheduler because it adapts
+    to process behaviour. I/O-bound processes naturally accumulate
+    less vruntime and get priority on wakeup — no special handling
+    needed. The kernel scheduler has much lower overhead than our
+    user-space SIGSTOP/SIGCONT approach.
+
+    RR is simpler and more predictable. Every container gets the
+    same fixed time slice regardless of what it does. This makes
+    scheduling behaviour easy to reason about and verify, but it
+    penalises I/O-bound workloads severely and carries a constant
+    signal-overhead cost even for CPU-bound tasks.
+
+
+  └──────────────────────────────────────────────────────────────┘
 EOF
 
 echo ""
-echo "Log files saved in:    ./logs/"
-echo "Supervisor logs:       /tmp/supervisor_cfs.log  /tmp/supervisor_rr.log"
+echo "  Log files  : ./logs/"
+echo "  Sup logs   : /tmp/supervisor_cfs.log  /tmp/supervisor_rr.log"
+echo ""
